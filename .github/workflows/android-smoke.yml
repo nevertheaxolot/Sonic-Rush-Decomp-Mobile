@@ -1,0 +1,1375 @@
+name: Android smoke test
+
+# Pega este archivo en tu fork como: .github/workflows/android-smoke.yml
+# (reemplaza el anterior). Al guardarlo (commit) se ejecuta solo.
+# Tambien puedes lanzarlo a mano desde Actions > Run workflow.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/android-smoke.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generar proyecto Android (shim PVR -> GLES2 + escena de prueba)
+        run: |
+          set -e
+          P=android-min
+          mkdir -p $P $P/app $P/app/src/main $P/app/src/main/cpp $P/app/src/main/cpp/shim $P/app/src/main/cpp/shim/dc $P/app/src/main/res/values $P/app/src/main/res/values-v28
+
+          cat > $P/app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+
+          android {
+              namespace 'com.srdc.port'
+              compileSdk 34
+              ndkVersion '26.1.10909125'
+
+              defaultConfig {
+                  applicationId 'com.srdc.port'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 3
+                  versionName '0.3'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path 'src/main/cpp/CMakeLists.txt'
+                      version '3.22.1'
+                  }
+              }
+          }
+          EOF
+
+          cat > $P/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > $P/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+
+          cat > $P/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "SonicRushAndroid"
+          include ':app'
+          EOF
+
+          cat > $P/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+              <application
+                  android:label="Sonic Rush Port"
+                  android:hasCode="false"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name="android.app.NativeActivity"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|uiMode|smallestScreenSize|density">
+                      <meta-data android:name="android.app.lib_name" android:value="srdc" />
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > $P/app/src/main/res/values-v28/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.NoTitleBar.Fullscreen">
+                  <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > $P/app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.NoTitleBar.Fullscreen" />
+          </resources>
+          EOF
+
+          cat > $P/app/src/main/cpp/CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(srdc C)
+
+          set(GLUE ${ANDROID_NDK}/sources/android/native_app_glue)
+          add_library(native_app_glue STATIC ${GLUE}/android_native_app_glue.c)
+          target_include_directories(native_app_glue PUBLIC ${GLUE})
+
+          add_library(srdc SHARED main.c test_scene.c shim/pvr_gles.c shim/pvr_decode.c)
+          target_include_directories(srdc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/shim)
+          set_target_properties(srdc PROPERTIES LINK_FLAGS "-u ANativeActivity_onCreate")
+          target_link_libraries(srdc native_app_glue android EGL GLESv2 log m)
+          EOF
+
+          cat > $P/app/src/main/cpp/main.c <<'EOF'
+          /* Plataforma Android (NativeActivity + EGL): arranca el shim PVR y la escena de prueba. */
+          #include <EGL/egl.h>
+          #include <GLES2/gl2.h>
+          #include <android/log.h>
+          #include <android_native_app_glue.h>
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <time.h>
+
+          #include "shim/pvr_gles.h"
+          #include "test_scene.h"
+
+          static FILE *g_log;
+          static void log_line(const char *s) {
+              __android_log_write(ANDROID_LOG_INFO, "srdc", s);
+              if (g_log) { fprintf(g_log, "%s\n", s); fflush(g_log); }
+          }
+          static void LOG(const char *fmt, ...) {
+              char buf[400];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(buf, sizeof buf, fmt, ap);
+              va_end(ap);
+              log_line(buf);
+          }
+
+          typedef struct {
+              EGLDisplay d;
+              EGLSurface s;
+              EGLContext c;
+              int ready, swap, scene_ready;
+          } St;
+
+          static int gl_init(St *st, ANativeWindow *w) {
+              EGLConfig cfg;
+              EGLint n = 0, depth;
+              const EGLint ctx[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+              st->d = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+              eglInitialize(st->d, 0, 0);
+              for (depth = 24; depth >= 16; depth -= 8) {   /* profundidad de 24 bits si se puede */
+                  const EGLint attr[] = {EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT, EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+                                         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_DEPTH_SIZE, depth, EGL_NONE};
+                  if (eglChooseConfig(st->d, attr, &cfg, 1, &n) && n >= 1) { LOG("EGL depth=%d", depth); break; }
+                  n = 0;
+              }
+              if (n < 1) { LOG("ERROR eglChooseConfig"); return -1; }
+              st->s = eglCreateWindowSurface(st->d, cfg, w, 0);
+              st->c = eglCreateContext(st->d, cfg, EGL_NO_CONTEXT, ctx);
+              if (!eglMakeCurrent(st->d, st->s, st->s, st->c)) { LOG("ERROR eglMakeCurrent"); return -1; }
+              eglSwapInterval(st->d, 1);
+              LOG("GL_RENDERER=%s", (const char *)glGetString(GL_RENDERER));
+              LOG("GL_VERSION=%s", (const char *)glGetString(GL_VERSION));
+              pvr_gles_set_surface(st->d, st->s);
+              if (pvr_gles_gl_init() != 0) return -1;
+              if (!st->scene_ready) { test_scene_init(); st->scene_ready = 1; }
+              return 0;
+          }
+
+          static void gl_term(St *st) {
+              pvr_gles_gl_lost();
+              pvr_gles_set_surface(EGL_NO_DISPLAY, EGL_NO_SURFACE);
+              if (st->d != EGL_NO_DISPLAY) {
+                  eglMakeCurrent(st->d, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+                  if (st->c != EGL_NO_CONTEXT) eglDestroyContext(st->d, st->c);
+                  if (st->s != EGL_NO_SURFACE) eglDestroySurface(st->d, st->s);
+                  eglTerminate(st->d);
+              }
+              st->d = EGL_NO_DISPLAY;
+              st->s = EGL_NO_SURFACE;
+              st->c = EGL_NO_CONTEXT;
+              st->ready = 0;
+          }
+
+          static void on_cmd(struct android_app *app, int32_t cmd) {
+              St *st = (St *)app->userData;
+              if (cmd == APP_CMD_INIT_WINDOW && app->window) st->ready = (gl_init(st, app->window) == 0);
+              else if (cmd == APP_CMD_TERM_WINDOW) gl_term(st);
+          }
+
+          static int32_t on_input(struct android_app *app, AInputEvent *e) {
+              St *st = (St *)app->userData;
+              if (AInputEvent_getType(e) == AINPUT_EVENT_TYPE_MOTION &&
+                  (AMotionEvent_getAction(e) & AMOTION_EVENT_ACTION_MASK) == AMOTION_EVENT_ACTION_DOWN) {
+                  st->swap = !st->swap;
+                  LOG("toque: swap=%d", st->swap);
+                  return 1;
+              }
+              return 0;
+          }
+
+          void android_main(struct android_app *app) {
+              St st;
+              char path[512];
+              const char *dir;
+              memset(&st, 0, sizeof st);
+              st.d = EGL_NO_DISPLAY; st.s = EGL_NO_SURFACE; st.c = EGL_NO_CONTEXT;
+              app->userData = &st;
+              app->onAppCmd = on_cmd;
+              app->onInputEvent = on_input;
+              dir = app->activity->externalDataPath ? app->activity->externalDataPath : app->activity->internalDataPath;
+              snprintf(path, sizeof path, "%s/log.txt", dir);
+              g_log = fopen(path, "w");
+              pvr_gles_set_log(log_line);
+              LOG("srdc 0.3 (shim PVR). log en: %s", path);
+
+              for (;;) {
+                  int ev;
+                  struct android_poll_source *src;
+                  while (ALooper_pollOnce(st.ready ? 0 : -1, 0, &ev, (void **)&src) >= 0) {
+                      if (src) src->process(app, src);
+                      if (app->destroyRequested) { gl_term(&st); LOG("salida"); return; }
+                  }
+                  if (st.ready) {
+                      struct timespec ts;
+                      clock_gettime(CLOCK_MONOTONIC, &ts);
+                      test_scene_frame(st.swap, (float)ts.tv_sec + (float)ts.tv_nsec * 1e-9f);   /* hace swap y limita a 60 fps */
+                  }
+              }
+          }
+          EOF
+
+          cat > $P/app/src/main/cpp/shim/dc/pvr.h <<'EOF'
+          /* Shim de <dc/pvr.h> (KallistiOS) para Android.
+           * Misma API que usa el juego; la implementacion (pvr_gles.c) dibuja con OpenGL ES 2.
+           * Las constantes de formato de textura y comandos coinciden con las de KOS. */
+          #ifndef SRDC_SHIM_DC_PVR_H
+          #define SRDC_SHIM_DC_PVR_H
+          #include <stddef.h>
+          #include <stdint.h>
+
+          typedef int pvr_list_t;
+          typedef void *pvr_ptr_t;
+
+          enum { PVR_LIST_OP_POLY = 0, PVR_LIST_OM_POLY = 1, PVR_LIST_TR_POLY = 2, PVR_LIST_TM_POLY = 3, PVR_LIST_PT_POLY = 4 };
+          typedef enum { PVR_UVFLIP_NONE = 0, PVR_UVFLIP_V = 1, PVR_UVFLIP_U = 2, PVR_UVFLIP_UV = 3 } pvr_uv_flip_t;
+          typedef enum { PVR_UVCLAMP_NONE = 0, PVR_UVCLAMP_V = 1, PVR_UVCLAMP_U = 2, PVR_UVCLAMP_UV = 3 } pvr_uv_clamp_t;
+
+          /* palabra de comando de pvr_prim (bits 31..29 = tipo) */
+          #define PVR_CMD_USERCLIP 0x20000000u
+          #define PVR_CMD_POLYHDR 0x80000000u   /* cabecera del shim (en KOS es 0x80840000) */
+          #define PVR_CMD_VERTEX 0xe0000000u
+          #define PVR_CMD_VERTEX_EOL 0xf0000000u
+
+          #define PVR_FILTER_NONE 0
+          #define PVR_FILTER_NEAREST 0
+          #define PVR_FILTER_BILINEAR 2
+          #define PVR_CULLING_NONE 0
+          #define PVR_CULLING_SMALL 1
+          #define PVR_CULLING_CCW 2
+          #define PVR_CULLING_CW 3
+          #define PVR_SPECULAR_DISABLE 0
+          #define PVR_SPECULAR_ENABLE 1
+          #define PVR_USERCLIP_DISABLE 0
+          #define PVR_USERCLIP_INSIDE 2
+          #define PVR_USERCLIP_OUTSIDE 3
+          #define PVR_PAL_ARGB1555 0
+          #define PVR_PAL_RGB565 1
+          #define PVR_PAL_ARGB4444 2
+          #define PVR_PAL_ARGB8888 3
+          #define PVR_BINSIZE_0 0
+          #define PVR_BINSIZE_8 8
+          #define PVR_BINSIZE_16 16
+          #define PVR_BINSIZE_32 32
+
+          #define PVR_TXRFMT_ARGB1555 0
+          #define PVR_TXRFMT_RGB565 (1 << 27)
+          #define PVR_TXRFMT_ARGB4444 (2 << 27)
+          #define PVR_TXRFMT_PAL4BPP (5 << 27)
+          #define PVR_TXRFMT_PAL8BPP (6 << 27)
+          #define PVR_TXRFMT_4BPP_PAL(x) ((x) << 21)
+          #define PVR_TXRFMT_8BPP_PAL(x) ((x) << 25)
+          #define PVR_TXRFMT_TWIDDLED 0
+          #define PVR_TXRFMT_NONTWIDDLED (1 << 26)
+          #define PVR_TXRLOAD_4BPP 0
+
+          typedef struct {
+              int opb_sizes[5];
+              int vertex_buf_size;
+              int dma_enabled;
+              int fsaa_enabled;
+              int autosort_disabled;
+              int opb_overflow_count;
+          } pvr_init_params_t;
+
+          /* cabecera de poligono compilada: 8 palabras (el shim codifica su propio formato) */
+          typedef struct {
+              union {
+                  uint32_t raw;
+                  struct { uint32_t lo : 16; uint32_t clip_mode : 2; uint32_t hi : 14; };
+              } m0;
+              uint32_t m1;   /* culling | specular<<2 | textured<<3 | uv_clamp<<4 | uv_flip<<6 | filter<<8 */
+              uint32_t fmt;  /* palabra de formato de textura (con banco de paleta) */
+              uint32_t ofs;  /* desplazamiento de la textura en la VRAM simulada */
+              uint32_t wh;   /* ancho | alto << 16 */
+              uint32_t pad[3];
+          } pvr_poly_hdr_t;
+
+          typedef struct {
+              int list_type;
+              struct { int culling; int specular; } gen;
+              struct {
+                  int enable;
+                  pvr_uv_flip_t uv_flip;
+                  pvr_uv_clamp_t uv_clamp;
+                  int filter;
+                  int format;
+                  int width, height;
+                  pvr_ptr_t base;
+              } txr;
+          } pvr_poly_cxt_t;
+
+          typedef struct { uint32_t flags; float x, y, z, u, v; uint32_t argb, oargb; } pvr_vertex_t;
+
+          int pvr_init(pvr_init_params_t *params);
+          int pvr_init_defaults(void);
+          void pvr_set_bg_color(float r, float g, float b);
+          void pvr_set_pal_format(int fmt);
+          void pvr_set_pal_entry(uint32_t idx, uint32_t value);
+          int pvr_wait_ready(void);
+          int pvr_wait_render_done(void);
+          int pvr_scene_begin(void);
+          int pvr_scene_finish(void);
+          int pvr_list_begin(pvr_list_t list);
+          int pvr_list_finish(void);
+          void pvr_poly_cxt_txr(pvr_poly_cxt_t *c, pvr_list_t list, int fmt, int w, int h, pvr_ptr_t ptr, int filter);
+          void pvr_poly_cxt_col(pvr_poly_cxt_t *c, pvr_list_t list);
+          void pvr_poly_compile(pvr_poly_hdr_t *h, pvr_poly_cxt_t *c);
+          int pvr_prim(void *data, int size);
+          pvr_ptr_t pvr_mem_malloc(size_t n);
+          void pvr_mem_free(pvr_ptr_t p);
+          uint32_t pvr_mem_available(void);
+          void pvr_txr_load(const void *src, pvr_ptr_t dst, uint32_t n);
+          uint32_t pvr_get_vbl_count(void);
+          void *pvr_dr_target(void);       /* escritura directa: un vertice de 32 bytes */
+          void pvr_dr_commit(void *v);
+          #endif
+          EOF
+
+          cat > $P/app/src/main/cpp/shim/pvr_decode.c <<'EOF'
+          #include "pvr_decode.h"
+
+          static uint32_t spread(uint32_t v) {
+              v &= 0xffffu;
+              v = (v | (v << 8)) & 0x00FF00FFu;
+              v = (v | (v << 4)) & 0x0F0F0F0Fu;
+              v = (v | (v << 2)) & 0x33333333u;
+              v = (v | (v << 1)) & 0x55555555u;
+              return v;
+          }
+
+          /* igual que tools/dreamcast/stages/stage2dc.py: y en los bits pares, x en los impares,
+           * dentro de cuadrados de min(w,h); los cuadrados se colocan en fila a lo largo del lado largo */
+          uint32_t pvrd_twiddle_index(int x, int y, int w, int h) {
+              uint32_t mn = (uint32_t)(w < h ? w : h);
+              uint32_t m = mn - 1u;
+              uint32_t idx = spread((uint32_t)y & m) | (spread((uint32_t)x & m) << 1);
+              idx += ((uint32_t)x / mn + (uint32_t)y / mn) * mn * mn;
+              return idx;
+          }
+
+          size_t pvrd_tex_bytes(int pf, int w, int h) {
+              size_t n = (size_t)w * (size_t)h;
+              if (pf == PVRD_PAL8) return n;
+              if (pf == PVRD_PAL4) return n < 2 ? 1 : n / 2;
+              if (pf == PVRD_ARGB1555 || pf == PVRD_RGB565 || pf == PVRD_ARGB4444) return n * 2;
+              return 0;
+          }
+
+          static uint32_t pack(uint32_t r, uint32_t g, uint32_t b, uint32_t a) { return r | g << 8 | b << 16 | a << 24; }
+
+          uint32_t pvrd_to_rgba(int pf, uint32_t p) {
+              uint32_t r, g, b, a;
+              if (pf == PVRD_RGB565) {
+                  r = (p >> 11) & 31; g = (p >> 5) & 63; b = p & 31;
+                  return pack((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2), 255);
+              }
+              if (pf == PVRD_ARGB4444) {
+                  a = (p >> 12) & 15; r = (p >> 8) & 15; g = (p >> 4) & 15; b = p & 15;
+                  return pack(r * 17, g * 17, b * 17, a * 17);
+              }
+              a = (p >> 15) & 1; r = (p >> 10) & 31; g = (p >> 5) & 31; b = p & 31;
+              return pack((r << 3) | (r >> 2), (g << 3) | (g >> 2), (b << 3) | (b >> 2), a ? 255 : 0);
+          }
+
+          int pvrd_decode(uint32_t f, int w, int h, const uint8_t *src, uint8_t *out) {
+              int pf = (int)((f >> 27) & 7u);
+              if (w < 1 || h < 1) return -1;
+              if (pf == PVRD_PAL8) {   /* las texturas con paleta siempre van twiddled */
+                  for (int y = 0; y < h; y++)
+                      for (int x = 0; x < w; x++) out[y * w + x] = src[pvrd_twiddle_index(x, y, w, h)];
+                  return 1;
+              }
+              if (pf == PVRD_PAL4) {   /* 2 texels por byte, nibble bajo primero */
+                  for (int y = 0; y < h; y++)
+                      for (int x = 0; x < w; x++) {
+                          uint32_t i = pvrd_twiddle_index(x, y, w, h);
+                          uint8_t b = src[i >> 1];
+                          out[y * w + x] = (i & 1u) ? (uint8_t)(b >> 4) : (uint8_t)(b & 15u);
+                      }
+                  return 1;
+              }
+              if (pf == PVRD_ARGB1555 || pf == PVRD_RGB565 || pf == PVRD_ARGB4444) {
+                  int nontw = (int)((f >> 26) & 1u);
+                  for (int y = 0; y < h; y++)
+                      for (int x = 0; x < w; x++) {
+                          uint32_t i = nontw ? (uint32_t)(y * w + x) : pvrd_twiddle_index(x, y, w, h);
+                          uint32_t p = (uint32_t)src[2 * i] | ((uint32_t)src[2 * i + 1] << 8);
+                          uint32_t c = pvrd_to_rgba(pf, p);
+                          uint8_t *o = &out[(size_t)(y * w + x) * 4];
+                          o[0] = (uint8_t)c; o[1] = (uint8_t)(c >> 8); o[2] = (uint8_t)(c >> 16); o[3] = (uint8_t)(c >> 24);
+                      }
+                  return 0;
+              }
+              return -1;
+          }
+          EOF
+
+          cat > $P/app/src/main/cpp/shim/pvr_decode.h <<'EOF'
+          /* Decodificacion de texturas del PowerVR2 (sin dependencias de GL: se prueba en PC). */
+          #ifndef SRDC_PVR_DECODE_H
+          #define SRDC_PVR_DECODE_H
+          #include <stddef.h>
+          #include <stdint.h>
+
+          enum { PVRD_ARGB1555 = 0, PVRD_RGB565 = 1, PVRD_ARGB4444 = 2, PVRD_PAL4 = 5, PVRD_PAL8 = 6 };
+
+          /* indice "twiddled" del texel (x,y) de una textura w x h (potencias de 2) */
+          uint32_t pvrd_twiddle_index(int x, int y, int w, int h);
+          /* bytes que ocupa una textura en VRAM (0 si el formato no esta soportado) */
+          size_t pvrd_tex_bytes(int pixfmt, int w, int h);
+          /* pixel de 16 bits -> RGBA (bytes r,g,b,a en memoria little-endian) */
+          uint32_t pvrd_to_rgba(int pixfmt, uint32_t p);
+          /* convierte una textura: devuelve 1 si out son indices de 8 bits (w*h bytes),
+           * 0 si out es RGBA8888 (w*h*4 bytes), -1 si el formato no esta soportado */
+          int pvrd_decode(uint32_t fmtword, int w, int h, const uint8_t *src, uint8_t *out);
+          #endif
+          EOF
+
+          cat > $P/app/src/main/cpp/shim/pvr_gles.c <<'EOF'
+          /* Shim del PVR2 sobre OpenGL ES 2.
+           * - La VRAM (8 MB) es un arreglo en RAM; las texturas se decodifican a GL al dibujar.
+           * - pvr_prim junta vertices por lista (OP / PT / TR); pvr_scene_finish dibuja todo
+           *   (OP, luego PT, luego TR) y hace swap. Las tiras se convierten en triangulos.
+           * - Profundidad: el PVR usa z (mayor = mas cerca, comparacion GREATER). Se mapea con
+           *   logaritmo a la profundidad de GL para conservar diferencias muy pequenas (3e-6). */
+          #include <EGL/egl.h>
+          #include <GLES2/gl2.h>
+          #include <dc/pvr.h>
+          #include <math.h>
+          #include <stdarg.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+
+          #include "pvr_decode.h"
+          #include "pvr_gles.h"
+
+          #define VRAM_SIZE (8u << 20)
+          #define VRAM_FIRST 0x10000u        /* el desplazamiento 0 nunca se entrega (puntero nulo) */
+          #define MAX_BLK 2048
+          #define MAX_TEX 512
+          #define ZCLIP 0.0001f              /* plano de fondo del PVR en KOS (PVR_BGPLANE_Z) */
+          #define TR_DEPTH_WRITE 1
+          #define FRAME_NS 16666667L         /* el juego va a 60 fps */
+
+          void (*pvr_gles_rdone_hook)(void);
+
+          /* ------------------------------------------------------------------ log */
+          static void (*g_logfn)(const char *);
+          void pvr_gles_set_log(void (*fn)(const char *)) { g_logfn = fn; }
+          static void plog(const char *fmt, ...) {
+              char buf[300];
+              va_list ap;
+              va_start(ap, fmt);
+              vsnprintf(buf, sizeof buf, fmt, ap);
+              va_end(ap);
+              if (g_logfn) g_logfn(buf);
+          }
+
+          /* ------------------------------------------------------------------ VRAM simulada */
+          typedef struct { uint32_t ofs, size; int used; } Blk;
+          static Blk g_blk[MAX_BLK];
+          static int g_nblk;
+          static uint8_t *g_vram;
+
+          static void tex_invalidate(uint32_t ofs, uint32_t n);
+
+          static int vram_init(void) {
+              if (g_vram) return 1;
+              g_vram = (uint8_t *)calloc(1, VRAM_SIZE);
+              if (!g_vram) return 0;
+              g_blk[0].ofs = VRAM_FIRST;
+              g_blk[0].size = VRAM_SIZE - VRAM_FIRST;
+              g_blk[0].used = 0;
+              g_nblk = 1;
+              return 1;
+          }
+
+          pvr_ptr_t pvr_mem_malloc(size_t n) {
+              uint32_t sz = (uint32_t)((n + 31u) & ~31u);
+              if (sz == 0) sz = 32;
+              if (!vram_init()) return NULL;
+              for (int i = 0; i < g_nblk; i++) {
+                  if (g_blk[i].used || g_blk[i].size < sz) continue;
+                  if (g_blk[i].size > sz && g_nblk < MAX_BLK) {
+                      memmove(&g_blk[i + 2], &g_blk[i + 1], (size_t)(g_nblk - i - 1) * sizeof(Blk));
+                      g_blk[i + 1].ofs = g_blk[i].ofs + sz;
+                      g_blk[i + 1].size = g_blk[i].size - sz;
+                      g_blk[i + 1].used = 0;
+                      g_nblk++;
+                      g_blk[i].size = sz;
+                  }
+                  g_blk[i].used = 1;
+                  return g_vram + g_blk[i].ofs;
+              }
+              plog("pvr_mem_malloc(%u) sin memoria", (unsigned)n);
+              return NULL;
+          }
+
+          void pvr_mem_free(pvr_ptr_t p) {
+              if (!g_vram || !p) return;
+              uint32_t ofs = (uint32_t)((uint8_t *)p - g_vram);
+              for (int i = 0; i < g_nblk; i++) {
+                  if (g_blk[i].ofs != ofs || !g_blk[i].used) continue;
+                  tex_invalidate(ofs, g_blk[i].size);
+                  g_blk[i].used = 0;
+                  if (i + 1 < g_nblk && !g_blk[i + 1].used) {
+                      g_blk[i].size += g_blk[i + 1].size;
+                      memmove(&g_blk[i + 1], &g_blk[i + 2], (size_t)(g_nblk - i - 2) * sizeof(Blk));
+                      g_nblk--;
+                  }
+                  if (i > 0 && !g_blk[i - 1].used) {
+                      g_blk[i - 1].size += g_blk[i].size;
+                      memmove(&g_blk[i], &g_blk[i + 1], (size_t)(g_nblk - i - 1) * sizeof(Blk));
+                      g_nblk--;
+                  }
+                  return;
+              }
+          }
+
+          uint32_t pvr_mem_available(void) {
+              uint32_t t = 0;
+              if (!vram_init()) return 0;
+              for (int i = 0; i < g_nblk; i++)
+                  if (!g_blk[i].used) t += g_blk[i].size;
+              return t;
+          }
+
+          void pvr_txr_load(const void *src, pvr_ptr_t dst, uint32_t n) {
+              if (!g_vram || !dst || !src) return;
+              uint32_t ofs = (uint32_t)((uint8_t *)dst - g_vram);
+              if (ofs >= VRAM_SIZE || n > VRAM_SIZE - ofs) { plog("pvr_txr_load fuera de rango"); return; }
+              memcpy(g_vram + ofs, src, n);
+              tex_invalidate(ofs, n);
+          }
+
+          /* ------------------------------------------------------------------ paleta (1024 entradas) */
+          static uint32_t g_pal[1024];       /* RGBA8888 (bytes r,g,b,a) */
+          static int g_palfmt = PVR_PAL_ARGB1555;
+          static int g_pal_dirty = 1;
+
+          void pvr_set_pal_format(int fmt) { g_palfmt = fmt; }
+          void pvr_set_pal_entry(uint32_t idx, uint32_t v) {
+              uint32_t c;
+              if (idx >= 1024) return;
+              if (g_palfmt == PVR_PAL_ARGB8888)
+                  c = ((v >> 16) & 255u) | (v & 0xff00u) | ((v & 255u) << 16) | (v & 0xff000000u);
+              else
+                  c = pvrd_to_rgba(g_palfmt == PVR_PAL_RGB565 ? PVRD_RGB565 : g_palfmt == PVR_PAL_ARGB4444 ? PVRD_ARGB4444 : PVRD_ARGB1555, v & 0xffffu);
+              g_pal[idx] = c;
+              g_pal_dirty = 1;
+          }
+
+          /* ------------------------------------------------------------------ estado de GL */
+          static EGLDisplay g_dpy = EGL_NO_DISPLAY;
+          static EGLSurface g_srf = EGL_NO_SURFACE;
+          static int g_gl_ok;
+          static GLuint g_prog, g_pal_tex;
+          static GLint a_pos, a_uv, a_col, a_off, u_tex, u_pal, u_mode, u_palbase, u_alpha, u_spec;
+
+          static const char *VS =
+              "attribute vec3 aPos;\n"
+              "attribute vec2 aUV;\n"
+              "attribute vec4 aCol;\n"
+              "attribute vec4 aOff;\n"
+              "varying vec2 vUV;\n"
+              "varying vec4 vCol;\n"
+              "varying vec3 vOff;\n"
+              "void main(){\n"
+              "  vUV = aUV; vCol = aCol; vOff = aOff.rgb;\n"
+              "  float d = clamp((log2(max(aPos.z, 1.0e-12)) + 40.0) / 60.0, 0.0, 1.0);\n"
+              "  gl_Position = vec4(aPos.x / 320.0 - 1.0, 1.0 - aPos.y / 240.0, 1.0 - 2.0 * d, 1.0);\n"
+              "}\n";
+
+          static const char *FS =
+              "#ifdef GL_FRAGMENT_PRECISION_HIGH\n"
+              "precision highp float;\n"
+              "#else\n"
+              "precision mediump float;\n"
+              "#endif\n"
+              "uniform sampler2D uTex;\n"
+              "uniform sampler2D uPal;\n"
+              "uniform float uMode;\n"      /* 0 plano, 1 textura RGBA, 2 textura con paleta */
+              "uniform float uPalBase;\n"   /* primera entrada de paleta del banco */
+              "uniform float uAlpha;\n"     /* 0 opaco, 1 mezcla (TR), 2 punch-through (PT) */
+              "uniform float uSpec;\n"
+              "varying vec2 vUV;\n"
+              "varying vec4 vCol;\n"
+              "varying vec3 vOff;\n"
+              "void main(){\n"
+              "  vec4 c = vCol;\n"
+              "  if (uMode > 1.5) {\n"
+              "    float idx = floor(texture2D(uTex, vUV).r * 255.0 + 0.5);\n"
+              "    float e = uPalBase + idx;\n"
+              "    vec4 p = texture2D(uPal, vec2((mod(e, 256.0) + 0.5) / 256.0, (floor(e / 256.0) + 0.5) / 4.0));\n"
+              "    c = vCol * p;\n"
+              "  } else if (uMode > 0.5) {\n"
+              "    c = vCol * texture2D(uTex, vUV);\n"
+              "  }\n"
+              "  c.rgb += vOff * uSpec;\n"
+              "  if (uAlpha < 0.5) c.a = 1.0;\n"
+              "  else if (uAlpha > 1.5) { if (c.a < 0.5) discard; c.a = 1.0; }\n"
+              "  gl_FragColor = c;\n"
+              "}\n";
+
+          static GLuint compile(GLenum type, const char *src) {
+              GLuint s = glCreateShader(type);
+              GLint ok = 0;
+              glShaderSource(s, 1, &src, NULL);
+              glCompileShader(s);
+              glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+              if (!ok) {
+                  char b[400];
+                  glGetShaderInfoLog(s, sizeof b, NULL, b);
+                  plog("ERROR shader: %s", b);
+                  return 0;
+              }
+              return s;
+          }
+
+          /* ------------------------------------------------------------------ cache de texturas */
+          typedef struct {
+              int used;
+              uint32_t ofs, bytes, last;
+              int w, h, pf, nontw, indexed;
+              GLuint id;
+              int filt, wr_s, wr_t;
+          } TexEnt;
+          static TexEnt g_tex[MAX_TEX];
+          static uint32_t g_frame;
+          static int g_tex_created;
+
+          static void tex_invalidate(uint32_t ofs, uint32_t n) {
+              for (int i = 0; i < MAX_TEX; i++) {
+                  TexEnt *t = &g_tex[i];
+                  if (!t->used) continue;
+                  if (ofs < t->ofs + t->bytes && t->ofs < ofs + n) {
+                      if (g_gl_ok && t->id) glDeleteTextures(1, &t->id);
+                      t->used = 0;
+                  }
+              }
+          }
+
+          static TexEnt *tex_get(uint32_t fmt, int w, int h, uint32_t ofs) {
+              int pf = (int)((fmt >> 27) & 7u);
+              int nontw = pf < 5 ? (int)((fmt >> 26) & 1u) : 0;
+              size_t bytes = pvrd_tex_bytes(pf, w, h);
+              TexEnt *free_e = NULL, *lru = NULL;
+              if (!g_vram || bytes == 0 || ofs >= VRAM_SIZE || bytes > VRAM_SIZE - ofs || w > 1024 || h > 1024) return NULL;
+              for (int i = 0; i < MAX_TEX; i++) {
+                  TexEnt *t = &g_tex[i];
+                  if (!t->used) { if (!free_e) free_e = t; continue; }
+                  if (t->ofs == ofs && t->w == w && t->h == h && t->pf == pf && t->nontw == nontw) {
+                      t->last = g_frame;
+                      return t;
+                  }
+                  if (!lru || t->last < lru->last) lru = t;
+              }
+              if (!free_e) {
+                  if (g_gl_ok && lru->id) glDeleteTextures(1, &lru->id);
+                  lru->used = 0;
+                  free_e = lru;
+              }
+              {
+                  uint8_t *tmp = (uint8_t *)malloc((size_t)w * (size_t)h * 4);
+                  int indexed;
+                  GLuint id = 0;
+                  if (!tmp) return NULL;
+                  indexed = pvrd_decode(fmt, w, h, g_vram + ofs, tmp);
+                  if (indexed < 0) { free(tmp); return NULL; }
+                  glActiveTexture(GL_TEXTURE0);
+                  glGenTextures(1, &id);
+                  glBindTexture(GL_TEXTURE_2D, id);
+                  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                  if (indexed)
+                      glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, w, h, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, tmp);
+                  else
+                      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, tmp);
+                  free(tmp);
+                  memset(free_e, 0, sizeof *free_e);
+                  free_e->used = 1;
+                  free_e->ofs = ofs;
+                  free_e->bytes = (uint32_t)bytes;
+                  free_e->w = w;
+                  free_e->h = h;
+                  free_e->pf = pf;
+                  free_e->nontw = nontw;
+                  free_e->indexed = indexed;
+                  free_e->id = id;
+                  free_e->filt = -1;
+                  free_e->wr_s = -1;
+                  free_e->wr_t = -1;
+                  free_e->last = g_frame;
+                  g_tex_created++;
+                  return free_e;
+              }
+          }
+
+          /* ------------------------------------------------------------------ cabeceras y lotes */
+          typedef struct {
+              uint32_t fmt, ofs;
+              uint16_t w, h;
+              uint8_t textured, specular, filter, uvflip, uvclamp, clip_on, pad0, pad1;
+              int16_t cx0, cy0, cx1, cy1;
+          } State;   /* 28 bytes, sin relleno: se compara con memcmp */
+
+          typedef struct { State st; int first, count; } Batch;
+          typedef struct { float x, y, z, u, v; uint8_t c[4]; uint8_t o[4]; } GlVert;
+          typedef struct {
+              GlVert *v; int nv, capv;
+              Batch *b; int nb, capb;
+              int tris;
+          } ListBuf;
+
+          static ListBuf g_list[5];
+          static int g_cur_list = -1;
+          static State g_hdr;           /* estado de la ultima cabecera */
+          static int g_hdr_cull;
+          static int g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1;   /* rectangulo de user clip en pixeles */
+          static pvr_vertex_t *g_strip;
+          static int g_nstrip, g_capstrip;
+          static float g_bg[3];
+          static pvr_init_params_t g_params;
+
+          static int list_ok(int l) { return l == PVR_LIST_OP_POLY || l == PVR_LIST_TR_POLY || l == PVR_LIST_PT_POLY; }
+
+          static void put_vert(GlVert *o, const pvr_vertex_t *p) {
+              o->x = p->x; o->y = p->y; o->z = p->z; o->u = p->u; o->v = p->v;
+              o->c[0] = (uint8_t)(p->argb >> 16); o->c[1] = (uint8_t)(p->argb >> 8); o->c[2] = (uint8_t)p->argb; o->c[3] = (uint8_t)(p->argb >> 24);
+              o->o[0] = (uint8_t)(p->oargb >> 16); o->o[1] = (uint8_t)(p->oargb >> 8); o->o[2] = (uint8_t)p->oargb; o->o[3] = (uint8_t)(p->oargb >> 24);
+          }
+
+          static void emit_tri(int list, const pvr_vertex_t *a, const pvr_vertex_t *b, const pvr_vertex_t *c) {
+              ListBuf *L = &g_list[list];
+              State st = g_hdr;
+              if (L->nv + 3 > L->capv) {
+                  int nc = L->capv ? L->capv * 2 : 3072;
+                  GlVert *nv = (GlVert *)realloc(L->v, (size_t)nc * sizeof(GlVert));
+                  if (!nv) return;
+                  L->v = nv;
+                  L->capv = nc;
+              }
+              if (st.clip_on) { st.cx0 = (int16_t)g_clip_x0; st.cy0 = (int16_t)g_clip_y0; st.cx1 = (int16_t)g_clip_x1; st.cy1 = (int16_t)g_clip_y1; }
+              if (L->nb == 0 || memcmp(&L->b[L->nb - 1].st, &st, sizeof st) != 0) {
+                  if (L->nb + 1 > L->capb) {
+                      int nc = L->capb ? L->capb * 2 : 256;
+                      Batch *nb = (Batch *)realloc(L->b, (size_t)nc * sizeof(Batch));
+                      if (!nb) return;
+                      L->b = nb;
+                      L->capb = nc;
+                  }
+                  L->b[L->nb].st = st;
+                  L->b[L->nb].first = L->nv;
+                  L->b[L->nb].count = 0;
+                  L->nb++;
+              }
+              put_vert(&L->v[L->nv + 0], a);
+              put_vert(&L->v[L->nv + 1], b);
+              put_vert(&L->v[L->nv + 2], c);
+              L->nv += 3;
+              L->b[L->nb - 1].count += 3;
+              L->tris++;
+          }
+
+          /* tira de triangulos -> triangulos, con culling: CW descarta los que se ven en sentido horario
+           * en pantalla (y hacia abajo), CCW los antihorarios; la paridad de la tira alterna el sentido */
+          static void strip_flush(void) {
+              int list = g_cur_list;
+              if (g_nstrip >= 3 && list_ok(list)) {
+                  for (int k = 2; k < g_nstrip; k++) {
+                      const pvr_vertex_t *a = &g_strip[k - 2], *b = &g_strip[k - 1], *c = &g_strip[k];
+                      if (g_hdr_cull == PVR_CULLING_CW || g_hdr_cull == PVR_CULLING_CCW) {
+                          float area = (b->x - a->x) * (c->y - a->y) - (c->x - a->x) * (b->y - a->y);
+                          if (k & 1) area = -area;
+                          if (g_hdr_cull == PVR_CULLING_CW && area > 0.0f) continue;
+                          if (g_hdr_cull == PVR_CULLING_CCW && area < 0.0f) continue;
+                      }
+                      emit_tri(list, a, b, c);
+                  }
+              }
+              g_nstrip = 0;
+          }
+
+          static void set_header(const pvr_poly_hdr_t *h) {
+              uint32_t m1 = h->m1;
+              memset(&g_hdr, 0, sizeof g_hdr);
+              g_hdr_cull = (int)(m1 & 3u);
+              g_hdr.specular = (uint8_t)((m1 >> 2) & 1u);
+              g_hdr.textured = (uint8_t)((m1 >> 3) & 1u);
+              g_hdr.uvclamp = (uint8_t)((m1 >> 4) & 3u);
+              g_hdr.uvflip = (uint8_t)((m1 >> 6) & 3u);
+              g_hdr.filter = (uint8_t)((m1 >> 8) & 3u);
+              g_hdr.fmt = h->fmt;
+              g_hdr.ofs = h->ofs;
+              g_hdr.w = (uint16_t)(h->wh & 0xffffu);
+              g_hdr.h = (uint16_t)(h->wh >> 16);
+              g_hdr.clip_on = (uint8_t)(h->m0.clip_mode == PVR_USERCLIP_INSIDE);
+          }
+
+          int pvr_prim(void *data, int size) {
+              const uint32_t *w = (const uint32_t *)data;
+              for (int off = 0; off + 32 <= size; off += 32, w += 8) {
+                  uint32_t type = w[0] >> 29;
+                  if (type == 7u) {   /* vertice */
+                      const pvr_vertex_t *v = (const pvr_vertex_t *)w;
+                      if (g_nstrip + 1 > g_capstrip) {
+                          int nc = g_capstrip ? g_capstrip * 2 : 256;
+                          pvr_vertex_t *ns = (pvr_vertex_t *)realloc(g_strip, (size_t)nc * sizeof(pvr_vertex_t));
+                          if (!ns) return -1;
+                          g_strip = ns;
+                          g_capstrip = nc;
+                      }
+                      g_strip[g_nstrip++] = *v;
+                      if (w[0] & 0x10000000u) strip_flush();
+                  } else if (type == 4u) {   /* cabecera de poligono */
+                      strip_flush();
+                      set_header((const pvr_poly_hdr_t *)w);
+                  } else if (type == 1u) {   /* user clip: casillas de 32 px, inclusivas */
+                      g_clip_x0 = (int)w[4] * 32; g_clip_y0 = (int)w[5] * 32;
+                      g_clip_x1 = ((int)w[6] + 1) * 32; g_clip_y1 = ((int)w[7] + 1) * 32;
+                  }
+              }
+              return 0;
+          }
+
+          void pvr_poly_cxt_txr(pvr_poly_cxt_t *c, pvr_list_t list, int fmt, int w, int h, pvr_ptr_t ptr, int filter) {
+              memset(c, 0, sizeof *c);
+              c->list_type = list;
+              c->gen.culling = PVR_CULLING_CCW;  /* valor por defecto de KOS: los quads en sentido horario (render.c) se ven */
+              c->txr.enable = 1;
+              c->txr.filter = filter;
+              c->txr.format = fmt;
+              c->txr.width = w;
+              c->txr.height = h;
+              c->txr.base = ptr;
+              c->txr.uv_flip = PVR_UVFLIP_NONE;
+              c->txr.uv_clamp = PVR_UVCLAMP_NONE;
+          }
+
+          void pvr_poly_cxt_col(pvr_poly_cxt_t *c, pvr_list_t list) {
+              memset(c, 0, sizeof *c);
+              c->list_type = list;
+              c->gen.culling = PVR_CULLING_CCW;
+          }
+
+          void pvr_poly_compile(pvr_poly_hdr_t *h, pvr_poly_cxt_t *c) {
+              uint32_t ofs = 0;
+              memset(h, 0, sizeof *h);
+              h->m0.raw = PVR_CMD_POLYHDR | ((uint32_t)(c->list_type & 7) << 24);
+              if (c->txr.enable && g_vram && c->txr.base) {
+                  long d = (long)((uint8_t *)c->txr.base - g_vram);
+                  if (d > 0 && d < (long)VRAM_SIZE) ofs = (uint32_t)d;
+              }
+              h->m1 = ((uint32_t)c->gen.culling & 3u) | ((uint32_t)(c->gen.specular != 0) << 2) |
+                      ((uint32_t)(c->txr.enable && ofs != 0) << 3) | (((uint32_t)c->txr.uv_clamp & 3u) << 4) |
+                      (((uint32_t)c->txr.uv_flip & 3u) << 6) | (((uint32_t)c->txr.filter & 3u) << 8);
+              h->fmt = (uint32_t)c->txr.format;
+              h->ofs = ofs;
+              h->wh = (uint32_t)c->txr.width | ((uint32_t)c->txr.height << 16);
+          }
+
+          /* ------------------------------------------------------------------ control de escena */
+          int pvr_init(pvr_init_params_t *p) { if (p) g_params = *p; vram_init(); return 0; }
+          int pvr_init_defaults(void) { vram_init(); return 0; }
+          void pvr_set_bg_color(float r, float g, float b) { g_bg[0] = r; g_bg[1] = g; g_bg[2] = b; }
+          int pvr_wait_ready(void) { return 0; }
+          int pvr_wait_render_done(void) { return 0; }
+          int pvr_list_begin(pvr_list_t l) { strip_flush(); g_cur_list = l; return 0; }
+          int pvr_list_finish(void) { strip_flush(); g_cur_list = -1; return 0; }
+
+          int pvr_scene_begin(void) {
+              for (int i = 0; i < 5; i++) { g_list[i].nv = 0; g_list[i].nb = 0; g_list[i].tris = 0; }
+              g_nstrip = 0;
+              g_cur_list = -1;
+              memset(&g_hdr, 0, sizeof g_hdr);
+              g_hdr_cull = PVR_CULLING_NONE;
+              return 0;
+          }
+
+          static float zdepth(float z) {   /* misma funcion que el vertex shader: profundidad de ventana */
+              float d = (log2f(z > 1.0e-12f ? z : 1.0e-12f) + 40.0f) / 60.0f;
+              d = d < 0.0f ? 0.0f : (d > 1.0f ? 1.0f : d);
+              return 1.0f - d;
+          }
+
+          static void apply_batch(const Batch *b, int list, int vx, int vy, int vw, int vh) {
+              const State *s = &b->st;
+              TexEnt *t = NULL;
+              float mode = 0.0f, palbase = 0.0f;
+              if (s->textured) t = tex_get(s->fmt, s->w, s->h, s->ofs);
+              glActiveTexture(GL_TEXTURE0);
+              if (t) {
+                  int filt = t->indexed ? 0 : (s->filter != 0);
+                  int ws = (s->uvclamp & 2) ? (int)GL_CLAMP_TO_EDGE : (s->uvflip & 2) ? (int)GL_MIRRORED_REPEAT : (int)GL_REPEAT;
+                  int wt = (s->uvclamp & 1) ? (int)GL_CLAMP_TO_EDGE : (s->uvflip & 1) ? (int)GL_MIRRORED_REPEAT : (int)GL_REPEAT;
+                  glBindTexture(GL_TEXTURE_2D, t->id);
+                  if (t->filt != filt) {
+                      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt ? GL_LINEAR : GL_NEAREST);
+                      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt ? GL_LINEAR : GL_NEAREST);
+                      t->filt = filt;
+                  }
+                  if (t->wr_t != wt || t->wr_s != ws) {
+                      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, ws);
+                      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wt);
+                      t->wr_t = wt;
+                      t->wr_s = ws;
+                  }
+                  if (t->indexed) {
+                      int pf = (int)((s->fmt >> 27) & 7u);
+                      mode = 2.0f;
+                      palbase = pf == PVRD_PAL4 ? (float)(((s->fmt >> 21) & 63u) * 16u) : (float)(((s->fmt >> 25) & 3u) * 256u);
+                  } else {
+                      mode = 1.0f;
+                  }
+              }
+              glUniform1f(u_mode, mode);
+              glUniform1f(u_palbase, palbase);
+              glUniform1f(u_spec, s->specular ? 1.0f : 0.0f);
+              glUniform1f(u_alpha, list == PVR_LIST_OP_POLY ? 0.0f : list == PVR_LIST_PT_POLY ? 2.0f : 1.0f);
+              if (s->clip_on) {
+                  int x0 = vx + s->cx0 * vw / 640, x1 = vx + s->cx1 * vw / 640;
+                  int y0 = vy + vh - s->cy1 * vh / 480, y1 = vy + vh - s->cy0 * vh / 480;
+                  glEnable(GL_SCISSOR_TEST);
+                  glScissor(x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0);
+              } else {
+                  glDisable(GL_SCISSOR_TEST);
+              }
+          }
+
+          static void render_frame(void) {
+              static const int order[3] = {PVR_LIST_OP_POLY, PVR_LIST_PT_POLY, PVR_LIST_TR_POLY};
+              EGLint sw = 0, sh = 0;
+              int vw, vh, vx, vy;
+              if (!g_gl_ok || g_dpy == EGL_NO_DISPLAY || g_srf == EGL_NO_SURFACE) return;
+              eglQuerySurface(g_dpy, g_srf, EGL_WIDTH, &sw);
+              eglQuerySurface(g_dpy, g_srf, EGL_HEIGHT, &sh);
+              if (sw <= 0 || sh <= 0) return;
+
+              glDisable(GL_SCISSOR_TEST);
+              glDepthMask(GL_TRUE);
+              glViewport(0, 0, sw, sh);
+              glClearColor(0.f, 0.f, 0.f, 1.f);
+              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+              vw = sw; vh = sw * 3 / 4;                         /* vista 4:3 centrada */
+              if (vh > sh) { vh = sh; vw = sh * 4 / 3; }
+              vx = (sw - vw) / 2; vy = (sh - vh) / 2;
+              glViewport(vx, vy, vw, vh);
+              glEnable(GL_SCISSOR_TEST);
+              glScissor(vx, vy, vw, vh);
+              glClearColor(g_bg[0], g_bg[1], g_bg[2], 1.f);
+              glClearDepthf(zdepth(ZCLIP));                     /* plano de fondo: z = 0.0001 */
+              glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+              glDisable(GL_CULL_FACE);
+              glEnable(GL_DEPTH_TEST);
+              glDepthFunc(GL_LESS);                             /* PVR GREATER sobre z, ya invertido */
+
+              glUseProgram(g_prog);
+              if (g_pal_dirty) {
+                  glActiveTexture(GL_TEXTURE1);
+                  glBindTexture(GL_TEXTURE_2D, g_pal_tex);
+                  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 4, 0, GL_RGBA, GL_UNSIGNED_BYTE, g_pal);
+                  g_pal_dirty = 0;
+              }
+              glActiveTexture(GL_TEXTURE1);
+              glBindTexture(GL_TEXTURE_2D, g_pal_tex);
+              glUniform1i(u_tex, 0);
+              glUniform1i(u_pal, 1);
+              glEnableVertexAttribArray((GLuint)a_pos);
+              glEnableVertexAttribArray((GLuint)a_uv);
+              glEnableVertexAttribArray((GLuint)a_col);
+              glEnableVertexAttribArray((GLuint)a_off);
+
+              for (int oi = 0; oi < 3; oi++) {
+                  int list = order[oi];
+                  ListBuf *L = &g_list[list];
+                  if (list == PVR_LIST_TR_POLY) {
+                      glEnable(GL_BLEND);
+                      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                      glDepthMask(TR_DEPTH_WRITE ? GL_TRUE : GL_FALSE);
+                  } else {
+                      glDisable(GL_BLEND);
+                      glDepthMask(GL_TRUE);
+                  }
+                  for (int i = 0; i < L->nb; i++) {
+                      const Batch *b = &L->b[i];
+                      const GlVert *v = L->v + b->first;
+                      if (b->count <= 0) continue;
+                      apply_batch(b, list, vx, vy, vw, vh);
+                      glVertexAttribPointer((GLuint)a_pos, 3, GL_FLOAT, GL_FALSE, sizeof(GlVert), &v->x);
+                      glVertexAttribPointer((GLuint)a_uv, 2, GL_FLOAT, GL_FALSE, sizeof(GlVert), &v->u);
+                      glVertexAttribPointer((GLuint)a_col, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlVert), v->c);
+                      glVertexAttribPointer((GLuint)a_off, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(GlVert), v->o);
+                      glDrawArrays(GL_TRIANGLES, 0, b->count);
+                  }
+              }
+              glDepthMask(GL_TRUE);
+              glDisable(GL_SCISSOR_TEST);
+              eglSwapBuffers(g_dpy, g_srf);
+          }
+
+          int pvr_scene_finish(void) {
+              strip_flush();
+              render_frame();
+              g_frame++;
+              if (g_frame % 600 == 0)
+                  plog("pvr: frame=%u tris OP=%d PT=%d TR=%d lotes OP=%d PT=%d TR=%d texturas creadas=%d libre=%uK",
+                       (unsigned)g_frame, g_list[0].tris, g_list[4].tris, g_list[2].tris, g_list[0].nb, g_list[4].nb,
+                       g_list[2].nb, g_tex_created, (unsigned)(pvr_mem_available() >> 10));
+          #ifndef PVRGLES_NO_SLEEP
+              {   /* limita a 60 fps (pantallas de 90/120 Hz) */
+                  static struct timespec next;
+                  struct timespec now;
+                  clock_gettime(CLOCK_MONOTONIC, &now);
+                  if (next.tv_sec == 0 || (now.tv_sec - next.tv_sec) * 1000000000L + (now.tv_nsec - next.tv_nsec) > 4 * FRAME_NS) next = now;
+                  next.tv_nsec += FRAME_NS;
+                  if (next.tv_nsec >= 1000000000L) { next.tv_nsec -= 1000000000L; next.tv_sec++; }
+                  clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL);
+              }
+          #endif
+              if (pvr_gles_rdone_hook) pvr_gles_rdone_hook();
+              return 0;
+          }
+
+          uint32_t pvr_get_vbl_count(void) {
+              struct timespec ts;
+              clock_gettime(CLOCK_MONOTONIC, &ts);
+              return (uint32_t)((double)ts.tv_sec * 60.0 + (double)ts.tv_nsec * 60.0e-9);
+          }
+
+          void *pvr_dr_target(void) {
+              static pvr_vertex_t scratch __attribute__((aligned(32)));
+              return &scratch;
+          }
+          void pvr_dr_commit(void *v) { pvr_prim(v, 32); }
+
+          /* ------------------------------------------------------------------ plataforma */
+          void pvr_gles_set_surface(EGLDisplay d, EGLSurface s) { g_dpy = d; g_srf = s; }
+
+          int pvr_gles_gl_init(void) {
+              GLuint vs, fs;
+              GLint ok = 0;
+              vram_init();
+              vs = compile(GL_VERTEX_SHADER, VS);
+              fs = compile(GL_FRAGMENT_SHADER, FS);
+              if (!vs || !fs) return -1;
+              g_prog = glCreateProgram();
+              glAttachShader(g_prog, vs);
+              glAttachShader(g_prog, fs);
+              glLinkProgram(g_prog);
+              glGetProgramiv(g_prog, GL_LINK_STATUS, &ok);
+              if (!ok) {
+                  char b[400];
+                  glGetProgramInfoLog(g_prog, sizeof b, NULL, b);
+                  plog("ERROR link: %s", b);
+                  return -1;
+              }
+              a_pos = glGetAttribLocation(g_prog, "aPos");
+              a_uv = glGetAttribLocation(g_prog, "aUV");
+              a_col = glGetAttribLocation(g_prog, "aCol");
+              a_off = glGetAttribLocation(g_prog, "aOff");
+              u_tex = glGetUniformLocation(g_prog, "uTex");
+              u_pal = glGetUniformLocation(g_prog, "uPal");
+              u_mode = glGetUniformLocation(g_prog, "uMode");
+              u_palbase = glGetUniformLocation(g_prog, "uPalBase");
+              u_alpha = glGetUniformLocation(g_prog, "uAlpha");
+              u_spec = glGetUniformLocation(g_prog, "uSpec");
+              glGenTextures(1, &g_pal_tex);
+              glActiveTexture(GL_TEXTURE1);
+              glBindTexture(GL_TEXTURE_2D, g_pal_tex);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+              glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+              g_pal_dirty = 1;
+              g_gl_ok = 1;
+              plog("pvr_gles listo (glGetError=%d)", (int)glGetError());
+              return 0;
+          }
+
+          void pvr_gles_gl_lost(void) {
+              for (int i = 0; i < MAX_TEX; i++) g_tex[i].used = 0;   /* se recrean desde la VRAM simulada */
+              g_gl_ok = 0;
+              g_prog = 0;
+              g_pal_tex = 0;
+              g_pal_dirty = 1;
+          }
+
+          void pvr_gles_dbg(int list, int *tris, int *batches) {
+              if (list < 0 || list > 4) return;
+              if (tris) *tris = g_list[list].tris;
+              if (batches) *batches = g_list[list].nb;
+          }
+          EOF
+
+          cat > $P/app/src/main/cpp/shim/pvr_gles.h <<'EOF'
+          /* Interfaz de plataforma del shim PVR -> OpenGL ES 2. */
+          #ifndef SRDC_PVR_GLES_H
+          #define SRDC_PVR_GLES_H
+          #include <EGL/egl.h>
+
+          void pvr_gles_set_log(void (*fn)(const char *line));
+          void pvr_gles_set_surface(EGLDisplay d, EGLSurface s);  /* superficie donde pvr_scene_finish hace swap */
+          int pvr_gles_gl_init(void);   /* con el contexto GL actual: shaders, paleta; 0 = ok */
+          void pvr_gles_gl_lost(void);  /* el contexto se destruyo: suelta los objetos GL (la VRAM simulada se conserva) */
+          extern void (*pvr_gles_rdone_hook)(void);  /* se llama al terminar cada render (equivale a RENDERDONE_TSP) */
+          /* estadisticas de la ultima escena: triangulos y lotes (batches) de una lista */
+          void pvr_gles_dbg(int list, int *tris, int *batches);
+          #endif
+          EOF
+
+          cat > $P/app/src/main/cpp/test_scene.c <<'EOF'
+          /* Escena de prueba: usa SOLO la API pvr_* (igual que el juego) para validar el shim. */
+          #include <dc/pvr.h>
+          #include <math.h>
+          #include <string.h>
+
+          #include "shim/pvr_decode.h"
+          #include "test_scene.h"
+
+          static pvr_ptr_t t_a1555, t_a4444, t_565, t_p8, t_p4;
+          static int s_swap_applied = -1;
+
+          static uint16_t c1555(int a, int r, int g, int b) { return (uint16_t)((a ? 0x8000 : 0) | ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)); }
+
+          void test_scene_init(void) {
+              static uint16_t px[32 * 32];
+              static uint8_t p8[32 * 32], p4[32 * 32 / 2];
+
+              /* ARGB1555 sin twiddle: circulo (alfa 1 bit) con degradado */
+              for (int y = 0; y < 32; y++)
+                  for (int x = 0; x < 32; x++) {
+                      int dx = x - 16, dy = y - 16, in = dx * dx + dy * dy < 15 * 15;
+                      px[y * 32 + x] = c1555(in, 255, 40 + x * 6, 40 + y * 6);
+                  }
+              t_a1555 = pvr_mem_malloc(sizeof px);
+              pvr_txr_load(px, t_a1555, sizeof px);
+
+              /* ARGB4444: desvanecido radial (translucido) */
+              for (int y = 0; y < 32; y++)
+                  for (int x = 0; x < 32; x++) {
+                      float d = sqrtf((float)((x - 16) * (x - 16) + (y - 16) * (y - 16))) / 16.0f;
+                      int a = d >= 1.0f ? 0 : (int)(15.0f * (1.0f - d));
+                      px[y * 32 + x] = (uint16_t)(a << 12 | 15 << 8 | 12 << 4 | 2);
+                  }
+              t_a4444 = pvr_mem_malloc(sizeof px);
+              pvr_txr_load(px, t_a4444, sizeof px);
+
+              /* RGB565 asimetrica (para ver los espejos): r = x, g = y, ajedrez en b */
+              for (int y = 0; y < 32; y++)
+                  for (int x = 0; x < 32; x++) {
+                      int b = (((x >> 3) + (y >> 3)) & 1) ? 31 : 4;
+                      px[y * 32 + x] = (uint16_t)(((x >> 0) & 31) << 11 | ((y * 2) & 63) << 5 | b);
+                  }
+              t_565 = pvr_mem_malloc(sizeof px);
+              pvr_txr_load(px, t_565, sizeof px);
+
+              /* PAL8 twiddled 32x32: indice 0 = transparente (borde), 1..15 en diagonales */
+              for (int y = 0; y < 32; y++)
+                  for (int x = 0; x < 32; x++) {
+                      int border = x == 0 || y == 0 || x == 31 || y == 31;
+                      p8[pvrd_twiddle_index(x, y, 32, 32)] = border ? 0 : (uint8_t)(1 + ((x / 3 + y / 3) % 15));
+                  }
+              t_p8 = pvr_mem_malloc(sizeof p8);
+              pvr_txr_load(p8, t_p8, sizeof p8);
+
+              /* PAL4 twiddled 32x32: 2 texels por byte, nibble bajo primero */
+              memset(p4, 0, sizeof p4);
+              for (int y = 0; y < 32; y++)
+                  for (int x = 0; x < 32; x++) {
+                      int border = x < 2 || y < 2 || x > 29 || y > 29;
+                      uint8_t v = border ? 0 : (uint8_t)(1 + ((x / 4 + y / 4) % 15));
+                      uint32_t i = pvrd_twiddle_index(x, y, 32, 32);
+                      p4[i >> 1] |= (i & 1u) ? (uint8_t)(v << 4) : v;
+                  }
+              t_p4 = pvr_mem_malloc(sizeof p4);
+              pvr_txr_load(p4, t_p4, sizeof p4);
+
+              pvr_set_pal_format(PVR_PAL_ARGB1555);
+              pvr_set_bg_color(0.0f, 0.0f, 0.0f);
+          }
+
+          static void set_palettes(int swap) {
+              for (int i = 0; i < 16; i++) {
+                  float f = (float)i;
+                  int r = (int)(127.5f + 127.5f * sinf(f * 0.45f)), g = (int)(127.5f + 127.5f * sinf(f * 0.45f + 2.1f)),
+                      b = (int)(127.5f + 127.5f * sinf(f * 0.45f + 4.2f));
+                  int gr = i * 17;
+                  /* PAL8 banco 0 = entradas 0..255 (0 transparente); PAL4 fila 5 = entradas 80..95 */
+                  pvr_set_pal_entry((uint32_t)i, i == 0 ? 0 : c1555(1, swap ? gr : r, swap ? gr : g, swap ? gr : b));
+                  pvr_set_pal_entry((uint32_t)(80 + i), i == 0 ? 0 : c1555(1, swap ? b : 255 - r, swap ? r : 255 - g, swap ? g : 255 - b));
+              }
+          }
+
+          /* cabecera + 4 vertices en tira, como el quad() de render.c */
+          static void quad(pvr_poly_cxt_t *cxt, int clip, float x, float y, float w, float h, float z, uint32_t argb,
+                           uint32_t oargb, float u0, float v0, float u1, float v1) {
+              pvr_poly_hdr_t hdr;
+              pvr_vertex_t v __attribute__((aligned(32)));
+              pvr_poly_compile(&hdr, cxt);
+              if (clip) hdr.m0.clip_mode = PVR_USERCLIP_INSIDE;
+              pvr_prim(&hdr, sizeof hdr);
+              v.flags = PVR_CMD_VERTEX; v.argb = argb; v.oargb = oargb; v.z = z;
+              v.x = x;     v.y = y + h; v.u = u0; v.v = v1; pvr_prim(&v, sizeof v);
+              v.x = x;     v.y = y;     v.u = u0; v.v = v0; pvr_prim(&v, sizeof v);
+              v.x = x + w; v.y = y + h; v.u = u1; v.v = v1; pvr_prim(&v, sizeof v);
+              v.flags = PVR_CMD_VERTEX_EOL;
+              v.x = x + w; v.y = y;     v.u = u1; v.v = v0; pvr_prim(&v, sizeof v);
+          }
+
+          static void flat(int list, float x, float y, float w, float h, float z, uint32_t argb) {
+              pvr_poly_cxt_t c;
+              pvr_poly_cxt_col(&c, list);
+              quad(&c, 0, x, y, w, h, z, argb, 0, 0, 0, 1, 1);
+          }
+
+          static void tex(int list, int fmt, int w, int hh, pvr_ptr_t p, float x, float y, float sw, float sh, float z,
+                          uint32_t argb) {
+              pvr_poly_cxt_t c;
+              pvr_poly_cxt_txr(&c, list, fmt, w, hh, p, PVR_FILTER_NONE);
+              quad(&c, 0, x, y, sw, sh, z, argb, 0, 0, 0, 1, 1);
+          }
+
+          void test_scene_frame(int swap, float t) {
+              pvr_poly_cxt_t c;
+              pvr_vertex_t v __attribute__((aligned(32)));
+              pvr_poly_hdr_t hdr;
+
+              if (s_swap_applied != swap) { set_palettes(swap); s_swap_applied = swap; }
+              pvr_wait_ready();
+              pvr_scene_begin();
+
+              /* ---------------- lista OP ---------------- */
+              pvr_list_begin(PVR_LIST_OP_POLY);
+              flat(PVR_LIST_OP_POLY, 0, 0, 640, 480, 0.0002f, 0xff141446u);            /* fondo (z > 0.0001) */
+              /* profundidad: rojo (z mayor = mas cerca) primero, verde despues: el rojo debe quedar encima */
+              flat(PVR_LIST_OP_POLY, 30, 30, 120, 120, 0.0059f, 0xffe02020u);
+              flat(PVR_LIST_OP_POLY, 90, 70, 120, 120, 0.0058f, 0xff20c040u);
+              /* culling: CW (sale desaparecido) y CCW (se ve, amarillo); ambos son horarios en pantalla */
+              pvr_poly_cxt_col(&c, PVR_LIST_OP_POLY); c.gen.culling = PVR_CULLING_CW;
+              quad(&c, 0, 240, 40, 70, 70, 0.006f, 0xffff4040u, 0, 0, 0, 1, 1);
+              pvr_poly_cxt_col(&c, PVR_LIST_OP_POLY); c.gen.culling = PVR_CULLING_CCW;
+              quad(&c, 0, 330, 40, 70, 70, 0.006f, 0xffffe040u, 0, 0, 0, 1, 1);
+              /* user clip: solo se ve el rectangulo (448,32)-(576,160) del cuadro cian */
+              {
+                  uint32_t w[8] __attribute__((aligned(32)));
+                  memset(w, 0, sizeof w);
+                  w[0] = PVR_CMD_USERCLIP; w[4] = 14; w[5] = 1; w[6] = 17; w[7] = 4;
+                  pvr_prim(w, sizeof w);
+              }
+              pvr_poly_cxt_col(&c, PVR_LIST_OP_POLY);
+              quad(&c, 1, 440, 20, 200, 160, 0.006f, 0xff30d0d0u, 0, 0, 0, 1, 1);
+              /* textura RGB565: normal / espejo en U / clamp en U / specular (suma rojo) */
+              pvr_poly_cxt_txr(&c, PVR_LIST_OP_POLY, PVR_TXRFMT_RGB565 | PVR_TXRFMT_NONTWIDDLED, 32, 32, t_565, PVR_FILTER_NONE);
+              quad(&c, 0, 30, 230, 90, 90, 0.006f, 0xffffffffu, 0, 0, 0, 1, 1);
+              c.txr.uv_flip = PVR_UVFLIP_U;
+              quad(&c, 0, 140, 230, 90, 90, 0.006f, 0xffffffffu, 0, 0, 0, 2, 1);
+              c.txr.uv_flip = PVR_UVFLIP_NONE; c.txr.uv_clamp = PVR_UVCLAMP_U;
+              quad(&c, 0, 250, 230, 90, 90, 0.006f, 0xffffffffu, 0, -0.5f, 0, 1.5f, 1);
+              c.txr.uv_clamp = PVR_UVCLAMP_NONE; c.gen.specular = PVR_SPECULAR_ENABLE;
+              quad(&c, 0, 360, 230, 90, 90, 0.006f, 0xffffffffu, 0x00600000u, 0, 0, 1, 1);
+              /* tira de 6 vertices con color por vertice (4 triangulos) */
+              pvr_poly_cxt_col(&c, PVR_LIST_OP_POLY);
+              pvr_poly_compile(&hdr, &c);
+              pvr_prim(&hdr, sizeof hdr);
+              {
+                  static const float sx[6] = {470, 470, 520, 520, 570, 570}, sy[6] = {450, 340, 450, 340, 450, 340};
+                  static const uint32_t sc[6] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xffffff00u, 0xffff00ffu, 0xff00ffffu};
+                  for (int i = 0; i < 6; i++) {
+                      v.flags = i == 5 ? PVR_CMD_VERTEX_EOL : PVR_CMD_VERTEX;
+                      v.x = sx[i]; v.y = sy[i]; v.z = 0.0066f; v.u = 0; v.v = 0; v.argb = sc[i]; v.oargb = 0;
+                      pvr_prim(&v, sizeof v);
+                  }
+              }
+              pvr_list_finish();
+
+              /* ---------------- lista PT (punch-through) ---------------- */
+              pvr_list_begin(PVR_LIST_PT_POLY);
+              tex(PVR_LIST_PT_POLY, PVR_TXRFMT_ARGB1555 | PVR_TXRFMT_NONTWIDDLED, 32, 32, t_a1555, 470.0f + 30.0f * sinf(t), 200, 100,
+                  100, 0.007f, 0xffffffffu);
+              tex(PVR_LIST_PT_POLY, PVR_TXRFMT_PAL8BPP | PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_8BPP_PAL(0), 32, 32, t_p8, 30, 350, 110,
+                  110, 0.007f, 0xffffffffu);
+              tex(PVR_LIST_PT_POLY, PVR_TXRFMT_PAL4BPP | PVR_TXRFMT_TWIDDLED | PVR_TXRFMT_4BPP_PAL(5), 32, 32, t_p4, 160, 350, 110,
+                  110, 0.007f, 0xffffffffu);
+              pvr_list_finish();
+
+              /* ---------------- lista TR (translucido) ---------------- */
+              pvr_list_begin(PVR_LIST_TR_POLY);
+              flat(PVR_LIST_TR_POLY, 60, 60, 150, 150, 0.0062f, 0x800040ffu);           /* azul 50% sobre rojo y verde */
+              tex(PVR_LIST_TR_POLY, PVR_TXRFMT_ARGB4444 | PVR_TXRFMT_NONTWIDDLED, 32, 32, t_a4444, 290, 330, 150, 150, 0.0065f,
+                  0xffffffffu);
+              pvr_list_finish();
+
+              pvr_scene_finish();
+          }
+          EOF
+
+          cat > $P/app/src/main/cpp/test_scene.h <<'EOF'
+          #ifndef SRDC_TEST_SCENE_H
+          #define SRDC_TEST_SCENE_H
+          void test_scene_init(void);                 /* texturas y paletas en la VRAM simulada */
+          void test_scene_frame(int swap, float t);   /* una escena completa con la API pvr_* */
+          #endif
+          EOF
+
+          find $P -type f | sort
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar NDK y CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "ndk;26.1.10909125" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Compilar APK
+        run: gradle -p android-min assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SonicRushAndroid-debug-apk
+          path: android-min/app/build/outputs/apk/debug/*.apk
